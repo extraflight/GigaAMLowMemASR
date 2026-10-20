@@ -1,0 +1,108 @@
+﻿# Python cache and build artifacts
+__pycache__/
+.gigacode/
+*.py[cod]
+*.pyc
+*.pyo
+*.pyd
+.Python
+build/
+dist/
+*.egg-info/
+*.egg
+.venv/
+venv/
+ENV/
+env/
+REPORT*
+
+# IDE/editor
+.vscode/
+.idea/
+*.code-workspace
+
+# Environment and secret files
+.env
+.env.local
+.env.*
+!.env.example
+
+# Local runtime data
+uploads/
+results/
+cache/
+temp/
+tmp/
+processing_stats.json
+
+# Models and downloads
+models/
+checkpoints/
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+
+# Hugging Face / torch caches
+.cache/
+.hf_cache/
+transformers_cache/
+
+# Media/output files
+*.wav
+*.mp3
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.webm
+*.flac
+*.ogg
+*.wma
+*.m4a
+*.txt
+!requirements.txt
+!requirements-dev.txt
+!requirements-tui.txt
+!requirements_macos.txt
+!requirements-macos-mlx.txt
+!requirements-macos-x86_64.txt
+!requirements-live-windows.txt
+!requirements-live-linux.txt
+!requirements-live-macos.txt
+!requirements-onnx-gpu.txt
+!requirements-legacy-pytorch.txt
+!requirements-sortformer.txt
+!web/static/robots.txt
+
+# Logs and temp files
+*.log
+logs/
+*.tmp
+*.bak
+*.swp
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Test and coverage artifacts
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.mypy_cache/
+.dmypy.json
+.pytype/
+.pyre/
+
+# Project-specific local folders
+.offline/
+offline/
+.opencode-*/
+.worktrees/
+
+# Keep the example env file tracked
+!.env.example

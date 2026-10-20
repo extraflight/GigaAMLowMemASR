@@ -1,0 +1,36 @@
+# GigaAM v3 - ONNX-only CLI + Telegram Bot
+# Без PyTorch, без MLX, без pyannote.audio — только ONNX Runtime
+
+--extra-index-url https://download.pytorch.org/whl/cpu
+
+# ONNX ASR + диаризация
+numpy>=1.24.0
+soundfile>=0.12.0
+soxr>=0.3.0
+onnx>=1.19.0
+onnx-asr>=0.10.0
+onnxruntime>=1.18.0
+huggingface-hub>=0.20.0
+
+# CLI
+rich>=13.0.0
+click>=8.1.0
+questionary>=2.0.0
+prompt_toolkit>=3.0.0
+
+# Telegram Bot
+python-telegram-bot>=21.0
+telethon>=1.36
+
+# Утилиты
+python-dotenv>=1.0.0
+pyyaml>=6.0
+aiohttp>=3.9.0
+
+# Pydub для определения длительности аудио (опционально)
+# pydub>=0.25.1
+
+# Примечания:
+# - FFmpeg должен быть установлен отдельно в системе
+# - Диаризация работает без HF-токена (ONNX-модели)
+# - Для установки: pip install -r requirements.txt

@@ -1,0 +1,13 @@
+__pycache__
+*.pyc
+*.pyo
+.git
+.gitignore
+*.md
+.env
+tests/
+.idea/
+.gigacode/
+*.mp3
+*.ogg
+

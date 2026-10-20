@@ -1,0 +1,475 @@
+"""ASR backend на базе ``onnx-asr`` и ONNX Runtime."""
+
+from __future__ import annotations
+
+import threading
+from collections.abc import Callable
+from typing import Any
+
+import numpy as np
+
+from ...config import ASR_SEGMENTATION_MODE
+from ...utils.model_cache import OnnxModelLocation, onnx_model_location
+from .chunking import (
+    AudioChunk,
+    plan_audio_chunks,
+    vad_regions_miss_active_audio,
+)
+from .longform import VadFailureMemo, absolute_words, assemble_segments, call_logger
+from .models import onnx_model_name, onnx_model_repo, validate_asr_model
+from .onnx_loading import load_asr_model
+from .onnx_provider import (
+    ProviderSelection,
+    available_onnx_providers,
+    onnx_session_providers,
+    resolve_onnx_providers,
+)
+from .onnx_vad import OnnxVadSegmenter
+from .token_timestamps import tokens_to_words
+from .types import (
+    BackendCapabilities,
+    TranscriptionSegment,
+    TranscriptionWord,
+    normalize_window_audio,
+)
+from .vad import VadSegmenter
+
+
+class OnnxBackend:
+    """Лениво загружаемый GigaAM backend через ONNX Runtime."""
+
+    name = "onnx"
+
+    def __init__(
+        self,
+        model: str | None = None,
+        *,
+        provider: str = "auto",
+        quantization: str | None = None,
+        model_dir: str | None = None,
+        vad_model: str = "silero",
+        segmentation_mode: str | None = None,
+        model_factory: Callable[..., Any] | None = None,
+        available_provider_probe: Callable[[], tuple[str, ...]] | None = None,
+        vad_segmenter_factory: Callable[..., VadSegmenter] | None = None,
+    ) -> None:
+        self.model_revision = validate_asr_model(model)
+        self.requested_provider = (provider or "auto").strip().lower() or "auto"
+        normalized_quantization = (quantization or "").strip().lower()
+        self.quantization = normalized_quantization or None
+        # Корень ONNX-моделей (ONNX_MODEL_DIR), а не каталог одной модели:
+        # ASR, VAD и диаризация берут в нём свои подкаталоги.
+        self.model_dir = model_dir
+        self.vad_model = vad_model
+        self.segmentation_strategy = segmentation_mode or ASR_SEGMENTATION_MODE
+        if self.segmentation_strategy not in {"vad", "overlap_chunks", "fixed_chunks"}:
+            raise ValueError(f"Неизвестный режим сегментации: {self.segmentation_strategy}")
+
+        self.model: Any | None = None
+        self.device: str | None = None
+        self.segmentation_mode = "not_run"
+        self.segmentation_fallback_reason: str | None = None
+        self.provider_selection: ProviderSelection | None = None
+        self._model_factory = model_factory
+        self._available_provider_probe = available_provider_probe or (
+            lambda: available_onnx_providers(self.requested_provider)
+        )
+        self._vad_segmenter_factory = vad_segmenter_factory or OnnxVadSegmenter
+        self._vad_segmenter: VadSegmenter | None = None
+        self._vad_failure = VadFailureMemo()
+        self._logger: Callable[[str], None] | None = None
+        self._inference_lock = threading.Lock()
+
+    @staticmethod
+    def _load_onnx_model(*args, **kwargs):
+        return load_asr_model(*args, **kwargs)
+
+    def model_location(self) -> OnnxModelLocation:
+        """Каталог ASR-модели: подкаталог ONNX_MODEL_DIR, офлайн-набор или HF-кэш."""
+        return onnx_model_location(
+            onnx_model_repo(self.model_revision),
+            root=self.model_dir,
+            accept_flat_root=True,
+        )
+
+    def _bundled_download_root(self) -> str | None:
+        # Строка: попадает в diagnostics()/health, которые сериализуются в JSON.
+        path = self.model_location().path
+        return str(path) if path is not None else None
+
+    def _create_model(self, selection: ProviderSelection) -> Any:
+        factory = self._model_factory or self._load_onnx_model
+        location = self.model_location()
+        
+        # Опции сессии: один поток CPU для стабильности на слабых устройствах.
+        import onnxruntime as _ort  # noqa: PLC0415
+
+        sess_options = _ort.SessionOptions()
+        sess_options.intra_op_num_threads = 1  # один поток для внутренних операций
+        sess_options.inter_op_num_threads = 1  # один поток для параллельных операций
+        sess_options.execution_mode = _ort.ExecutionMode.ORT_SEQUENTIAL  # последовательно
+        sess_options.graph_optimization_level = _ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        
+        kwargs: dict[str, Any] = {
+            "path": location.path,
+            "quantization": self.quantization,
+            "providers": onnx_session_providers(selection),
+            "preprocessor_config": {"use_numpy_preprocessors": False},
+        }
+        if location.offline is not None:
+            kwargs["offline"] = location.offline
+
+        # Пробуем передать sess_options (совместимость с разными версиями onnx-asr)
+        try:
+            kwargs["sess_options"] = sess_options
+            raw_model = factory(onnx_model_name(self.model_revision), **kwargs)
+        except TypeError:
+            # Старая версия onnx-asr не принимает sess_options
+            # Используем Manager с config
+            from onnx_asr.loader import Manager  # noqa: PLC0415
+            
+            config = {
+                "sess_options": sess_options,
+                "providers": onnx_session_providers(selection),
+                "provider_options": None,
+            }
+            manager = Manager(
+                providers=onnx_session_providers(selection),
+                preprocessor_config={"use_numpy_preprocessors": False},
+            )
+            raw_model = manager.create_asr(
+                onnx_model_name(self.model_revision),
+                location.path,
+                quantization=self.quantization,
+                offline=location.offline if location.offline is not None else None,
+                config=config,
+            )
+        
+        return raw_model.with_timestamps()
+
+    def load(self, logger: Callable[[str], None] | None = None) -> bool:
+        self._logger = logger
+        if self.model is not None:
+            return True
+
+        try:
+            selection = resolve_onnx_providers(
+                self.requested_provider,
+                available=self._available_provider_probe(),
+            )
+            self.model = self._create_model(selection)
+            self.provider_selection = selection
+            self.device = selection.active
+            if logger:
+                message = (
+                    f"Модель готова (ONNX, {self.model_revision}); "
+                    f"вычисления выполняются на: {selection.active}"
+                )
+                if selection.fallback_reason:
+                    message += f". {selection.fallback_reason}"
+                logger(message)
+            return True
+        except Exception as exc:
+            self.model = None
+            self.provider_selection = None
+            self.device = None
+            if logger:
+                logger(f"Не удалось загрузить модель распознавания (ONNX):\n{exc}")
+            return False
+
+    def transcribe_longform(
+        self,
+        audio_path: str,
+        progress_callback: Callable[[float, float | None, float | None], None] | None = None,
+        logger: Callable[[str], None] | None = None,
+        cancel_check: Callable[[], bool] | None = None,
+    ) -> list[TranscriptionSegment]:
+        with self._inference_lock, call_logger(self, logger):
+            observed_total: float | None = None
+
+            tracked_callback = progress_callback
+            if progress_callback is not None:
+
+                def tracked_callback(ratio, processed, total):
+                    nonlocal observed_total
+                    observed_total = total
+                    progress_callback(ratio, processed, total)
+
+            try:
+                return self._transcribe_longform_unlocked(
+                    audio_path,
+                    progress_callback=tracked_callback,
+                    cancel_check=cancel_check,
+                )
+            except Exception as exc:
+                if not self._retry_on_cpu_after_provider_failure(exc):
+                    raise
+                if progress_callback is not None:
+                    # Повтор идёт с начала файла. Без явного нуля потребитель
+                    # видит только скачок прогресса назад и не понимает, почему.
+                    progress_callback(0.0, 0.0, observed_total)
+                return self._transcribe_longform_unlocked(
+                    audio_path,
+                    progress_callback=tracked_callback,
+                    cancel_check=cancel_check,
+                )
+
+    def transcribe_window(
+        self,
+        audio: np.ndarray,
+        sample_rate: int,
+        offset_samples: int,
+    ) -> list[TranscriptionSegment]:
+        if self.model is None:
+            raise RuntimeError("Модель не загружена")
+        if offset_samples < 0:
+            raise ValueError("offset_samples must be non-negative")
+        window = normalize_window_audio(audio, sample_rate)
+        with self._inference_lock:
+            decoded = self.model.recognize(window, sample_rate=16_000)
+        text = str(getattr(decoded, "text", decoded) or "").strip()
+        if not text:
+            return []
+        start = offset_samples / sample_rate
+        end = start + len(window) / 16_000
+        segment: TranscriptionSegment = {"transcription": text, "boundaries": (start, end)}
+        relative_words = tokens_to_words(
+            getattr(decoded, "tokens", None),
+            getattr(decoded, "timestamps", None),
+            duration=len(window) / 16_000,
+        )
+        if relative_words is not None:
+            segment["words"] = [
+                {"text": word["text"], "start": start + word["start"], "end": start + word["end"]}
+                for word in relative_words
+            ]
+        return [segment]
+
+    def _retry_on_cpu_after_provider_failure(self, exc: Exception) -> bool:
+        selection = self.provider_selection
+        if (
+            self.requested_provider != "auto"
+            or selection is None
+            or selection.active == "cpu"
+            or "CPUExecutionProvider" not in self._available_provider_probe()
+        ):
+            return False
+
+        failed_provider = selection.providers[0]
+        if not self._is_provider_runtime_failure(exc, failed_provider):
+            return False
+        reason = (
+            f"{failed_provider} завершил inference с ошибкой "
+            f"{type(exc).__name__}: {exc}; транскрибация начата заново "
+            "на CPUExecutionProvider, прогресс отсчитывается с нуля"
+        )
+        cpu_selection = ProviderSelection(
+            requested="auto",
+            active="cpu",
+            providers=("CPUExecutionProvider",),
+            fallback_reason=reason,
+        )
+        if self._logger:
+            self._logger(f"Внимание: {reason}")
+        self.model = self._create_model(cpu_selection)
+        self.provider_selection = cpu_selection
+        self.device = "cpu"
+        return True
+
+    @staticmethod
+    def _is_provider_runtime_failure(exc: Exception, provider: str) -> bool:
+        """Не маскировать CPU fallback-ом ошибки ввода, VAD и callback-ов."""
+        module = type(exc).__module__.lower()
+        if module.startswith("onnxruntime"):
+            return True
+
+        message = f"{type(exc).__name__}: {exc}".lower()
+        provider_markers = {
+            "CoreMLExecutionProvider": ("coreml",),
+            "CUDAExecutionProvider": ("cuda", "cudnn"),
+            "TensorrtExecutionProvider": ("tensorrt",),
+            "DmlExecutionProvider": ("directml", "dml"),
+        }
+        markers = provider_markers.get(provider, ())
+        return "executionprovider" in message or any(marker in message for marker in markers)
+
+    def _ensure_vad_segmenter(self) -> VadSegmenter:
+        blocked = self._vad_failure.blocked(self.vad_model)
+        if blocked is not None:
+            raise RuntimeError(blocked)
+        if self._vad_segmenter is None:
+            try:
+                self._vad_segmenter = self._vad_segmenter_factory(
+                    model=self.vad_model,
+                    provider=self.requested_provider,
+                    quantization=self.quantization,
+                    model_dir=self.model_dir,
+                )
+            except Exception as exc:
+                # Модель VAD не поднимается в этом окружении. Без запоминания
+                # каждый файл батча заново пытался бы её скачать и загрузить;
+                # через VAD_RETRY_COOLDOWN_SECONDS попытка повторяется.
+                self._vad_failure.remember(self.vad_model, f"{type(exc).__name__}: {exc}")
+                raise
+            self._vad_failure.clear()
+        return self._vad_segmenter
+
+    def _transcribe_longform_unlocked(
+        self,
+        audio_path: str,
+        progress_callback: Callable[[float, float | None, float | None], None] | None = None,
+        cancel_check: Callable[[], bool] | None = None,
+    ) -> list[TranscriptionSegment]:
+        if self.model is None:
+            raise RuntimeError("Модель не загружена")
+
+        import soundfile as sf  # noqa: PLC0415
+
+        samples, sample_rate = sf.read(audio_path, dtype="float32", always_2d=True)
+        # Канонический WAV — моно: столбец без копии, а `samples` освобождаем.
+        # Раньше mean(axis=1) делал вторую копию, и обе жили всю транскрибацию
+        # (~460 МБ на час записи).
+        if samples.shape[1] == 1:
+            audio = np.ascontiguousarray(samples[:, 0])
+        else:
+            audio = samples.mean(axis=1)
+        del samples
+        total_samples = int(audio.shape[0])
+        total_seconds = total_samples / sample_rate if sample_rate else 0.0
+
+        if self.segmentation_strategy == "fixed_chunks":
+            boundaries = [
+                (
+                    float(start) / sample_rate,
+                    float(min(start + 20 * sample_rate, total_samples)) / sample_rate,
+                )
+                for start in range(0, total_samples, 20 * sample_rate)
+            ]
+            chunks = plan_audio_chunks(
+                audio,
+                boundaries,
+                sample_rate=sample_rate,
+                max_chunk_seconds=20.0,
+                overlap_seconds=0.0,
+            )
+            self.segmentation_mode = "fixed_chunks"
+            self.segmentation_fallback_reason = (
+                "VAD отключён настройкой: использовано разбиение по 20 секунд"
+            )
+        elif self.segmentation_strategy == "vad":
+            try:
+                segmenter = self._ensure_vad_segmenter()
+                if isinstance(segmenter, OnnxVadSegmenter):
+                    # VAD работает по уже загруженной дорожке, а не читает файл
+                    # заново (ещё две полные копии float32).
+                    boundaries = segmenter.segment_waveform(
+                        audio,
+                        sample_rate,
+                        audio_duration=total_seconds,
+                    )
+                else:
+                    boundaries = segmenter.segment_file(
+                        audio_path,
+                        audio_duration=total_seconds,
+                    )
+                if vad_regions_miss_active_audio(audio, boundaries, sample_rate=sample_rate):
+                    chunks = plan_audio_chunks(
+                        audio,
+                        [(0.0, total_seconds)],
+                        sample_rate=sample_rate,
+                        max_chunk_seconds=20.0,
+                    )
+                    self.segmentation_mode = "overlap_chunks"
+                    self.segmentation_fallback_reason = (
+                        "VAD пропустил длинный участок с активным звуком; "
+                        "использовано полное разбиение по тихим точкам с перекрытием"
+                    )
+                    if self._logger:
+                        self._logger(f"Внимание: {self.segmentation_fallback_reason}")
+                else:
+                    chunks = plan_audio_chunks(
+                        audio,
+                        boundaries,
+                        sample_rate=sample_rate,
+                        max_chunk_seconds=20.0,
+                    )
+                    self.segmentation_mode = "vad"
+                    self.segmentation_fallback_reason = None
+            except Exception as exc:
+                chunks = plan_audio_chunks(
+                    audio,
+                    [(0.0, total_seconds)],
+                    sample_rate=sample_rate,
+                    max_chunk_seconds=20.0,
+                )
+                self.segmentation_mode = "overlap_chunks"
+                self.segmentation_fallback_reason = (
+                    f"ONNX VAD недоступен ({type(exc).__name__}: {exc}); "
+                    "использовано разбиение по тихим точкам с перекрытием"
+                )
+                if self._logger:
+                    self._logger(f"Внимание: {self.segmentation_fallback_reason}")
+        else:
+            chunks = plan_audio_chunks(
+                audio,
+                [(0.0, total_seconds)],
+                sample_rate=sample_rate,
+                max_chunk_seconds=20.0,
+            )
+            self.segmentation_mode = "overlap_chunks"
+            self.segmentation_fallback_reason = (
+                "VAD отключён настройкой: использовано разбиение "
+                "по тихим точкам с перекрытием"
+            )
+
+        def decode(chunk: AudioChunk) -> tuple[str, list[TranscriptionWord] | None]:
+            start = chunk.decode_start_sample
+            end = chunk.decode_end_sample
+            decoded = self.model.recognize(audio[start:end], sample_rate=sample_rate)
+            relative_words = tokens_to_words(
+                getattr(decoded, "tokens", None),
+                getattr(decoded, "timestamps", None),
+                duration=float(end - start) / sample_rate,
+            )
+            # Времена токенов — float32-шаг энкодера: округляем, чтобы сдвиг на
+            # начало окна не давал хвостов вроде 10.100000000000001.
+            return (
+                str(getattr(decoded, "text", decoded) or ""),
+                absolute_words(relative_words, float(start) / sample_rate, digits=9),
+            )
+
+        return assemble_segments(
+            chunks,
+            decode,
+            total_seconds=total_seconds,
+            # Окна короче 0.1 с не декодируем.
+            min_chunk_samples=max(1, sample_rate // 10),
+            progress_callback=progress_callback,
+            cancel_check=cancel_check,
+        )
+
+    def unload(self) -> None:
+        with self._inference_lock:
+            self.model = None
+            self._vad_segmenter = None
+            self._vad_failure.clear()
+            self.provider_selection = None
+            self.device = None
+            self.segmentation_mode = "not_run"
+            self.segmentation_fallback_reason = None
+
+    def is_loaded(self) -> bool:
+        return self.model is not None
+
+    def capabilities(self) -> BackendCapabilities:
+        selection = self.provider_selection
+        return BackendCapabilities(
+            backend=self.name,
+            model=self.model_revision,
+            device=self.device or "N/A",
+            segmentation_mode=self.segmentation_mode,
+            segmentation_fallback_reason=self.segmentation_fallback_reason,
+            provider=selection.providers[0] if selection else None,
+            quantization=self.quantization,
+            provider_fallback_reason=selection.fallback_reason if selection else None,
+        )

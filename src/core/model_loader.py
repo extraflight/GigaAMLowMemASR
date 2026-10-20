@@ -1,0 +1,313 @@
+"""Модуль загрузки и управления моделью GigaAM."""
+
+import os
+from pathlib import Path
+
+from ..config import (
+    ASR_BACKEND,
+    ASR_MODEL,
+    ONNX_MODEL_DIR,
+    ONNX_PROVIDER,
+    ONNX_QUANTIZATION,
+    ONNX_VAD_MODEL,
+)
+from ..utils.model_cache import hf_repo_is_cached
+from .asr.factory import create_backend_from_config
+from .asr.models import onnx_model_repo, validate_asr_model
+from .asr.types import ProgressCallback
+from .runtime_options import validate_onnx_provider
+
+
+class ModelLoader:
+    """Класс для загрузки и управления моделью GigaAM."""
+
+    def __init__(
+        self,
+        requested_backend: str | None = None,
+        *,
+        model_name: str | None = None,
+        model_revision: str | None = None,
+        onnx_provider: str | None = None,
+        onnx_quantization: str | None = None,
+        onnx_model_dir: str | None = None,
+        onnx_vad_model: str | None = None,
+    ):
+        self.model = None
+        self.device = None
+        self._backend = None
+        self._requested_backend = (requested_backend or ASR_BACKEND).strip().lower() or ASR_BACKEND
+        self._model_name = model_name or ASR_MODEL
+        self._model_revision = validate_asr_model(model_revision or ASR_MODEL)
+        self._onnx_provider = onnx_provider or ONNX_PROVIDER
+        self._onnx_quantization = (
+            ONNX_QUANTIZATION if onnx_quantization is None else onnx_quantization
+        )
+        self._onnx_model_dir = onnx_model_dir or ONNX_MODEL_DIR
+        self._onnx_vad_model = onnx_vad_model or ONNX_VAD_MODEL
+        self._fallback_reason = None
+        self._factory_error: str | None = None
+
+    @property
+    def requested_backend(self) -> str:
+        return self._requested_backend
+
+    @property
+    def requested_provider(self) -> str:
+        return self._onnx_provider
+
+    @property
+    def active_backend(self) -> str:
+        return self.backend_name
+
+    @property
+    def backend_name(self) -> str:
+        return self._backend.name if self._backend is not None else self._requested_backend
+
+    def _apply_requested_backend(self, requested_backend: str) -> None:
+        requested = requested_backend.strip().lower()
+        if not requested:
+            requested = ASR_BACKEND
+        if requested == self._requested_backend and self._backend is not None:
+            return
+        self._requested_backend = requested
+        self.unload()
+        self._fallback_reason = None
+        self._factory_error = None
+        self._backend = None
+
+    def _ensure_backend(self) -> None:
+        if self._backend is not None:
+            return
+        backend, fallback_reason = create_backend_from_config(
+            requested_backend=self._requested_backend,
+            model_name=self._model_name,
+            model_revision=self._model_revision,
+            mlx_model_repo="",
+            allow_fallback=False,
+            onnx_provider=self._onnx_provider,
+            onnx_quantization=self._onnx_quantization,
+            onnx_model_dir=self._onnx_model_dir,
+            onnx_vad_model=self._onnx_vad_model,
+        )
+        self._backend = backend
+        self._fallback_reason = fallback_reason
+
+    def _sync_from_backend(self) -> None:
+        if self._backend is None:
+            self.model = None
+            self.device = None
+            return
+
+        if hasattr(self._backend, "model"):
+            self.model = self._backend.model
+        if hasattr(self._backend, "device"):
+            self.device = self._backend.device
+
+    def _load_with_fallback(self, logger=None) -> bool:
+        if self._backend is None or self._backend.is_loaded():
+            return True
+
+        if self._backend.load(logger=logger):
+            self._sync_from_backend()
+            return True
+
+        self._factory_error = f"{self._backend.name} не загрузился"
+        return False
+
+    def load_model(self, logger=None):
+        """Загружает выбранный backend ASR."""
+        if self._backend is not None and self._backend.is_loaded():
+            self._sync_from_backend()
+            return True
+
+        if logger:
+            logger(f"Движок распознавания: {self._requested_backend}")
+
+        try:
+            self._ensure_backend()
+        except Exception as exc:
+            if logger:
+                logger(f"Не удалось запустить движок распознавания: {exc}")
+            self._factory_error = f"Не удалось запустить движок распознавания: {exc}"
+            return False
+
+        if self._backend is None:
+            if logger:
+                logger("Не удалось выбрать движок распознавания для загрузки модели")
+            self._fallback_reason = None
+            return False
+
+        if self._load_with_fallback(logger=logger):
+            self._factory_error = None
+            return True
+
+        if logger:
+            logger(f"Не удалось загрузить модель через движок {self._backend.name}")
+        self._factory_error = (
+            f"Не удалось загрузить модель через движок {self._backend.name if self._backend else 'неизвестный'}"
+        )
+        return False
+
+    def missing_asr_resources(self) -> tuple[str, ...]:
+        """Вернуть веса, которые выбранный backend будет скачивать при загрузке."""
+        if self.is_loaded():
+            return ()
+        self._ensure_backend()
+        backend = self._backend
+        if backend is None:
+            return ()
+
+        if backend.name == "onnx":
+            repo_id = onnx_model_repo(backend.model_revision)
+            location = backend.model_location()
+            directory = location.path
+            if directory is not None and Path(directory).is_dir() and any(
+                path.is_file() for path in Path(directory).rglob("*")
+            ):
+                return ()
+            return () if hf_repo_is_cached(repo_id) else (f"ONNX ASR: {repo_id}",)
+
+        return ()
+
+    @property
+    def _bundle_download_root(self) -> str | None:
+        if self._backend is None:
+            return None
+        return getattr(self._backend, "_bundled_download_root", lambda: None)()
+
+    def _empty_cache(self):
+        """Освобождает кэш ускорителя (ONNX — нет необходимости)."""
+
+    def transcribe_longform(
+        self,
+        audio_path: str,
+        progress_callback: ProgressCallback | None = None,
+        logger=None,
+        cancel_check=None,
+    ):
+        """Транскрибирует длинное аудио через выбранную стратегию сегментации.
+
+        ``logger`` — журнал текущего файла: модель загружается один раз, и
+        logger из load_model принадлежит той задаче, которая её загрузила.
+        """
+        if self._backend is None:
+            raise RuntimeError("Модель не загружена")
+
+        if not self._backend.is_loaded():
+            raise RuntimeError("Модель не загружена")
+
+        kwargs = {"progress_callback": progress_callback}
+        if logger is not None:
+            kwargs["logger"] = logger
+        if cancel_check is not None:
+            kwargs["cancel_check"] = cancel_check
+        try:
+            return self._backend.transcribe_longform(audio_path, **kwargs)
+        finally:
+            # ONNX backend может подменить сессию на CPU прямо во время
+            # inference. Без ресинка loader держал бы ссылку на упавшую
+            # сессию и показывал её provider в диагностике.
+            self._sync_from_backend()
+
+    def transcribe_window(self, audio, sample_rate: int, offset_samples: int):
+        """Decode an in-memory live-ASR window with the active backend."""
+        if self._backend is None or not self._backend.is_loaded():
+            raise RuntimeError("Модель не загружена")
+        try:
+            return self._backend.transcribe_window(audio, sample_rate, offset_samples)
+        finally:
+            self._sync_from_backend()
+
+    def unload(self):
+        """Выгружает модель и освобождает память."""
+        self.model = None
+        if self._backend is not None:
+            try:
+                self._backend.unload()
+            except Exception:
+                pass
+        self.device = None
+        self._backend = None
+        self._fallback_reason = None
+        self._factory_error = None
+
+    def is_loaded(self) -> bool:
+        """Проверяет, загружена ли модель."""
+        if self._backend is not None:
+            return self._backend.is_loaded()
+        return self.model is not None
+
+    def diagnostics(self) -> dict[str, object]:
+        model = self._model_name
+        device = "N/A"
+        active = self.backend_name
+        segmentation_mode = None
+        segmentation_fallback_reason = None
+        provider = None
+        quantization = None
+        provider_fallback_reason = None
+
+        if self._backend is not None:
+            try:
+                capabilities = self._backend.capabilities()
+                model = capabilities.model
+                device = capabilities.device
+                segmentation_mode = getattr(capabilities, "segmentation_mode", None)
+                segmentation_fallback_reason = getattr(
+                    capabilities,
+                    "segmentation_fallback_reason",
+                    None,
+                )
+                provider = getattr(capabilities, "provider", None)
+                quantization = getattr(capabilities, "quantization", None)
+                provider_fallback_reason = getattr(
+                    capabilities,
+                    "provider_fallback_reason",
+                    None,
+                )
+            except Exception:
+                pass
+
+        return {
+            "requested_backend": self._requested_backend,
+            "active_backend": active,
+            "fallback_reason": self._fallback_reason,
+            "model": model,
+            "device": device or "N/A",
+            "segmentation_mode": segmentation_mode,
+            "segmentation_fallback_reason": segmentation_fallback_reason,
+            "requested_provider": self._onnx_provider,
+            "provider": provider,
+            "quantization": quantization,
+            "provider_fallback_reason": provider_fallback_reason,
+            "cache_root": self._bundle_download_root,
+            "repo": getattr(self, '_mlx_model_repo', None),
+            "loader_loaded": self.is_loaded(),
+            "error": self._factory_error,
+        }
+
+    @property
+    def requested_model(self) -> str:
+        return self._model_revision
+
+    def configure_model(self, model_revision: str) -> None:
+        """Select an ASR model for the next load."""
+        selected = validate_asr_model(model_revision)
+        # Фабрика передаёт MLX именно model_name: если обновить только
+        # revision, MLX грузил прежнюю модель, падал и молча уступал PyTorch.
+        self._model_name = selected
+        if selected != self._model_revision:
+            self._model_revision = selected
+            self.unload()
+
+    def configure_backend(self, requested_backend: str | None = None) -> None:
+        """Переконфигурировать backend перед следующей загрузкой."""
+        requested = (requested_backend or ASR_BACKEND).strip().lower() or ASR_BACKEND
+        self._apply_requested_backend(requested)
+
+    def configure_onnx_runtime(self, *, provider: str) -> None:
+        """Выбрать ONNX Runtime provider для следующей загрузки модели."""
+        selected = validate_onnx_provider(provider)
+        if selected != self._onnx_provider:
+            self._onnx_provider = selected
+            self.unload()
