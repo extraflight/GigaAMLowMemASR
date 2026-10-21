@@ -27,6 +27,8 @@ class EmbeddingResult:
     valid: np.ndarray
     window_indices: np.ndarray
     local_speakers: np.ndarray
+    # Секунд речи, ушедших в эмбеддинг строки (для двухэтапной кластеризации).
+    durations: np.ndarray | None = None
 
 
 class OnnxSpeakerEmbeddings:
@@ -37,8 +39,9 @@ class OnnxSpeakerEmbeddings:
         model_dir: str | None = None,
         sample_rate: int = 16_000,
         threshold: float = 0.5,
-        min_speech_seconds: float = 0.5,
+        min_speech_seconds: float | None = None,
         batch_size: int | None = None,
+        exclude_overlap: bool | None = None,
         model_factory: Callable[..., Any] | None = None,
         available_provider_probe: Callable[[], tuple[str, ...]] | None = None,
     ) -> None:
@@ -46,6 +49,12 @@ class OnnxSpeakerEmbeddings:
         self.model_dir = model_dir
         self.sample_rate = sample_rate
         self.threshold = threshold
+        # Минимум речи в строке, чтобы считать для неё эмбеддинг. Короткие реплики
+        # («угу», «да») ниже порога выпадают из разметки. DIARIZATION_MIN_SPEECH_SEC=0.3
+        # возвращает их, но короткие эмбеддинги шумные: используйте вместе с
+        # DIARIZATION_RELIABLE_SEC (см. clustering.py).
+        if min_speech_seconds is None:
+            min_speech_seconds = float(os.getenv("DIARIZATION_MIN_SPEECH_SEC", "0.5"))
         self.min_speech_seconds = min_speech_seconds
         # Активации ResNet34 растут пропорционально батчу: на CPU батч 16 по 10 с
         # поднимал RSS примерно на гигабайт. Меняется без правки кода:
@@ -53,6 +62,13 @@ class OnnxSpeakerEmbeddings:
         if batch_size is None:
             batch_size = int(os.getenv("DIARIZATION_EMBEDDING_BATCH", "16"))
         self.batch_size = max(1, int(batch_size))
+        # Не брать в эмбеддинг кадры, где одновременно говорят двое: чужой голос
+        # в «чистом» эмбеддинге сдвигает его к соседнему спикеру. Если чистой речи
+        # меньше min_speech_seconds, берётся вся маска, как раньше.
+        # DIARIZATION_EXCLUDE_OVERLAP=1 включает.
+        if exclude_overlap is None:
+            exclude_overlap = os.getenv("DIARIZATION_EXCLUDE_OVERLAP", "0") == "1"
+        self.exclude_overlap = bool(exclude_overlap)
         self._model_factory = model_factory
         self._available_provider_probe = available_provider_probe or (
             lambda: available_onnx_providers(self.provider)
@@ -142,6 +158,7 @@ class OnnxSpeakerEmbeddings:
         probabilities = segmentation.probabilities
         rows = probabilities.shape[0] * probabilities.shape[2]
         valid = np.zeros(rows, dtype=np.bool_)
+        durations = np.zeros(rows, dtype=np.float32)
         window_indices = np.repeat(np.arange(probabilities.shape[0]), probabilities.shape[2])
         local_speakers = np.tile(np.arange(probabilities.shape[2]), probabilities.shape[0])
         min_samples = max(1, int(round(self.min_speech_seconds * self.sample_rate)))
@@ -180,6 +197,11 @@ class OnnxSpeakerEmbeddings:
             speech = float(frame_mask.sum()) * segmentation.frame_step
             if speech < self.min_speech_seconds:
                 continue
+            if self.exclude_overlap:
+                others = (probabilities[window_index] >= self.threshold).sum(axis=1)
+                clean = frame_mask & (others == 1)
+                if float(clean.sum()) * segmentation.frame_step >= self.min_speech_seconds:
+                    frame_mask = clean
             start = int(round(segmentation.window_starts[window_index] * self.sample_rate))
             mask = np.repeat(frame_mask, frame_samples)
             end = min(len(audio), start + len(mask))
@@ -193,6 +215,7 @@ class OnnxSpeakerEmbeddings:
             if len(chunk) < min_samples:
                 continue
             valid[row] = True
+            durations[row] = len(chunk) / self.sample_rate
             valid_rows.append(row)
             pending.append(chunk)
             if len(pending) >= self._batch_limit:
@@ -213,6 +236,7 @@ class OnnxSpeakerEmbeddings:
             valid=valid,
             window_indices=window_indices,
             local_speakers=local_speakers,
+            durations=durations,
         )
 
     def unload(self) -> None:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import os
 
 import numpy as np
 
@@ -28,8 +29,17 @@ def reconstruct_speaker_segments(
 
     speaker_count = int(valid_labels.max()) + 1
     total_frames = max(1, int(math.ceil(segmentation.audio_duration / segmentation.frame_step)))
+    # DIARIZATION_EDGE_WEIGHT=1: кадры у краёв окна менее надёжны (модель видит
+    # меньше контекста), поэтому при усреднении перекрывающихся окон центр
+    # получает больший вес (окно Хэмминга). Без переменной — простое среднее.
+    edge_weight = os.getenv("DIARIZATION_EDGE_WEIGHT", "0") == "1"
+    frame_weights = (
+        np.hamming(probabilities.shape[1]).astype(np.float32) if edge_weight else None
+    )
     sums = np.zeros((total_frames, speaker_count), dtype=np.float32)
-    counts = np.zeros((total_frames, speaker_count), dtype=np.int32)
+    counts = np.zeros(
+        (total_frames, speaker_count), dtype=np.float32 if edge_weight else np.int32
+    )
     local_count = probabilities.shape[2]
 
     for window_index, window_start in enumerate(segmentation.window_starts):
@@ -51,8 +61,13 @@ def reconstruct_speaker_segments(
             window_probability = probabilities[window_index, :length, :][:, local_mask].max(
                 axis=1
             )
-            sums[start_frame:end_frame, label] += window_probability
-            counts[start_frame:end_frame, label] += 1
+            if frame_weights is None:
+                sums[start_frame:end_frame, label] += window_probability
+                counts[start_frame:end_frame, label] += 1
+            else:
+                weights = frame_weights[:length]
+                sums[start_frame:end_frame, label] += window_probability * weights
+                counts[start_frame:end_frame, label] += weights
 
     global_probabilities = np.divide(
         sums,

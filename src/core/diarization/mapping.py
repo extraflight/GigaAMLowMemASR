@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import logging
 import math
+import os
 
 from .base import SpeakerSegment
 
@@ -16,6 +18,8 @@ MAX_SPEAKER_SNAP_DISTANCE_SEC = 2.0
 # слишком грубы, чтобы менять говорящего.
 MIN_SPEAKER_TURN_SEC = 0.4
 TIMELINE_EPSILON_SEC = 1e-6
+
+_LOG = logging.getLogger(__name__)
 
 
 def _validated_timed_words(trans_seg: dict) -> list[dict]:
@@ -62,6 +66,15 @@ class SpeakerMappingMixin:
             speaker_names: кастомные имена {"speaker_1": "Врач", "speaker_2": "Пациент"}
         """
         order = list(dict.fromkeys(segment.speaker for segment in segments))
+        # DIARIZATION_NAMING_MIN_TURN_SEC=1.0: «первым» считается тот, чей первый
+        # сегмент не короче порога. Иначе кашель или шум в начале записи,
+        # отнесённый ко второму голосу, меняет местами «Врача» и «Пациента».
+        min_turn = float(os.getenv("DIARIZATION_NAMING_MIN_TURN_SEC", "0"))
+        if min_turn > 0:
+            solid = list(
+                dict.fromkeys(s.speaker for s in segments if s.end - s.start >= min_turn)
+            )
+            order = solid + [name for name in order if name not in solid]
         
         if speaker_names:
             # Используем кастомные имена
@@ -83,14 +96,24 @@ class SpeakerMappingMixin:
         speaker_segments: list[SpeakerSegment],
     ) -> list:
         mapped = []
+        without_words = 0
         for trans_seg in transcription_segments:
             words = self._resolve_word_speakers(trans_seg, speaker_segments)
             if not words:
+                without_words += 1
                 turns = [self._map_segment_without_words(trans_seg, speaker_segments)]
                 self._append_mapped_turns(mapped, turns)
                 continue
             turns = self._group_words_into_turns(self._smooth_micro_turns(words))
             self._append_mapped_turns(mapped, turns)
+        if without_words:
+            _LOG.warning(
+                "Диаризация: у %d из %d сегментов ASR нет корректных пословных "
+                "таймстемпов, спикер назначен сегменту целиком (смена говорящего "
+                "внутри такого сегмента теряется)",
+                without_words,
+                len(transcription_segments),
+            )
         return mapped
 
     @staticmethod

@@ -10,10 +10,25 @@ services:
       - AUDIO_PREPROCESSING_MODE=off
       - LOG_LEVEL=WARNING
       - TELETHON_SESSION=/data/telethon_bot
-      # Для анализа всей записи одним проходом включите строку ниже: 0 отключает нарезку на части.
+      # Для диаризации всей записи одним проходом включите строку ниже: 0 отключает нарезку на части.
       # Внимание: полный файл может потребовать существенно больше памяти и вызвать OOM.
       - CHUNK_SECONDS=0
       - MALLOC_ARENA_MAX=2
+      # Порог слияния при автоопределении числа спикеров. Больше — кластеров
+      # меньше (риск склеить разных людей), меньше — больше (риск разрезать
+      # одного). DEFAULT DIARIZATION_THRESHOLD=0.6 
+      - DIARIZATION_THRESHOLD=1.1
+      # Не брать в эмбеддинг кадры, где одновременно говорят двое: чужой голос
+      # в «чистом» эмбеддинге сдвигает его к соседнему спикеру. Если чистой речи
+      # меньше min_speech_seconds, берётся вся маска, как раньше.
+      # DIARIZATION_EXCLUDE_OVERLAP=1 включает.
+      - DIARIZATION_EXCLUDE_OVERLAP=1
+      # Минимум речи в строке, чтобы считать для неё эмбеддинг. Короткие реплики
+      # («угу», «да») ниже порога выпадают из разметки. DIARIZATION_MIN_SPEECH_SEC=0.3
+      # возвращает их, но короткие эмбеддинги шумные: используйте вместе с
+      # DIARIZATION_RELIABLE_SEC (см. clustering.py).
+      - DIARIZATION_MIN_SPEECH_SEC=0.5
+      - DIARIZATION_EDGE_WEIGHT=1
     volumes:
       - hf_cache:/app/.hf_cache
       - tg-session:/data
